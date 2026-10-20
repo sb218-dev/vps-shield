@@ -7,7 +7,7 @@
 #
 # Функционал:
 #  1. Отключение ICMP (Ping) на уровне ядра (sysctl + iptables)
-#  2. Блокировка BitTorrent / P2P трафика (xt_string сигнатуры + стандартные порты)
+#  2. Блокировка BitTorrent / P2P трафика (L4 iptables + BEP 15/03/DHT + L7 Xray DPI)
 #  3. Блокировка IP-чекеров и геолокационных сервисов (динамический ipset)
 #  4. Блокировка RU-сегмента (.ru, .рф, .su) по актуальным базам CIDR (ipset hash:net)
 #  5. Защита локальных сетей (RFC 1918) от случайной блокировки (SSH, LAN, DNS)
@@ -67,7 +67,7 @@ install_shield() {
     echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections 2>/dev/null || true
 
     apt-get update -y
-    apt-get install -y ipset iptables iptables-persistent netfilter-persistent curl dnsutils
+    apt-get install -y ipset iptables iptables-persistent netfilter-persistent curl dnsutils python3
     modprobe xt_string 2>/dev/null || true
 
     echo -e "\n${CYAN}>>> [2/7] Создание исполняемого скрипта ядра защиты ($SCRIPT_PATH)...${NC}"
@@ -75,7 +75,6 @@ install_shield() {
 #!/usr/bin/env bash
 set -e
 
-# Защита от параллельного запуска нескольких копий процесса (flock)
 LOCKFILE="/var/lock/vps-shield.lock"
 exec 200>"$LOCKFILE"
 if ! flock -n 200; then
@@ -134,15 +133,14 @@ if [ $LOADED -eq 0 ]; then
     echo "[VPS-SHIELD] Внимание: Не удалось загрузить внешнюю базу RU-зоны, сохранены предыдущие правила."
 fi
 
-echo "[VPS-SHIELD] 5. Применение правил фильтрации iptables..."
+echo "[VPS-SHIELD] 5. Применение правил фильтрации iptables (P2P/BitTorrent & Security)..."
 iptables -N VPS_SHIELD 2>/dev/null || iptables -F VPS_SHIELD
 
 # --- БЕЛЫЙ СПИСОК (Локальный трафик и служебные соединения) ---
 iptables -A VPS_SHIELD -i lo -j ACCEPT
 iptables -A VPS_SHIELD -o lo -j ACCEPT
-iptables -A VPS_SHIELD -m state --state ESTABLISHED,RELATED -j ACCEPT
 
-# Локальные приватные сети (RFC 1918) - предотвращает блокировку SSH и локальных сервисов
+# Локальные приватные сети (RFC 1918)
 iptables -A VPS_SHIELD -d 10.0.0.0/8 -j ACCEPT
 iptables -A VPS_SHIELD -d 172.16.0.0/12 -j ACCEPT
 iptables -A VPS_SHIELD -d 192.168.0.0/16 -j ACCEPT
@@ -157,22 +155,100 @@ iptables -A VPS_SHIELD -m set --match-set ip_checkers dst -j DROP
 # --- БЛОКИРОВКА RU-ЗОНЫ ---
 iptables -A VPS_SHIELD -m set --match-set ru_zone dst -j DROP
 
-# --- БЛОКИРОВКА BITTORRENT / P2P ТРАФИКА ---
-BT_SIGS=("BitTorrent" "BitTorrent protocol" "peer_id=" ".torrent" "announce" "info_hash" "get_peers" "find_node")
-for sig in "${BT_SIGS[@]}"; do
+# ------------------------------------------------------------------------------
+# --- БЛОКИРОВКА BITTORRENT / P2P ТРАФИКА (СТРОГО ДО ESTABLISHED/RELATED!) ---
+# ------------------------------------------------------------------------------
+
+# 1. Стандартные порты трекеров и P2P-клиентов (входящие и исходящие)
+iptables -A VPS_SHIELD -p tcp -m multiport --dports 6881:6889,51413,6969,1337,2710 -j DROP
+iptables -A VPS_SHIELD -p udp -m multiport --dports 6881:6889,51413,6969,1337,2710 -j DROP
+iptables -A VPS_SHIELD -p tcp -m multiport --sports 6881:6889,51413,6969,1337,2710 -j DROP
+iptables -A VPS_SHIELD -p udp -m multiport --sports 6881:6889,51413,6969,1337,2710 -j DROP
+
+# 2. BEP 15: Магический заголовок подключения к UDP-трекеру (0x0000041727101980)
+iptables -A VPS_SHIELD -p udp -m string --algo bm --hex-string "|0000041727101980|" -j DROP
+
+# 3. BEP 03: Хекс-сигнатура рукопожатия BitTorrent (\x13BitTorrent protocol)
+iptables -A VPS_SHIELD -p tcp -m string --algo bm --hex-string "|13426974546f7272656e742070726f746f636f6c|" -j DROP
+
+# 4. DHT (Distributed Hash Table) bencoded сигнатуры over UDP
+DHT_PATTERNS=(
+    "d1:ad2:id"
+    "d1:rd2:id"
+    "d1:q4:ping"
+    "d1:q9:find_node"
+    "d1:q9:get_peers"
+    "d1:q13:announce_peer"
+)
+for pat in "${DHT_PATTERNS[@]}"; do
+    iptables -A VPS_SHIELD -p udp -m string --algo bm --string "$pat" -j DROP
+done
+
+# 5. Строковые сигнатуры протокола и HTTP-трекеров
+BT_STRINGS=(
+    "BitTorrent"
+    "BitTorrent protocol"
+    "peer_id="
+    ".torrent"
+    "announce?info_hash"
+    "announce.php?passkey="
+    "info_hash="
+    "info_hash"
+    "announce_peer"
+)
+for sig in "${BT_STRINGS[@]}"; do
     iptables -A VPS_SHIELD -m string --algo bm --string "$sig" -j DROP
 done
 
-# Стандартные порты трекеров и P2P-клиентов
-iptables -A VPS_SHIELD -p tcp -m multiport --dports 6881:6889,51413,6969,1337 -j DROP
-iptables -A VPS_SHIELD -p udp -m multiport --dports 6881:6889,51413,6969,1337 -j DROP
+# --- РАЗРЕШЕНИЕ УСТАНОВЛЕННЫХ СОЕДИНЕНИЙ (ДЛЯ ОБЫЧНОГО ТРАФИКА) ---
+iptables -A VPS_SHIELD -m state --state ESTABLISHED,RELATED -j ACCEPT
 
-# Привязка цепочки VPS_SHIELD к OUTPUT и FORWARD первыми правилами
+# Привязка цепочки VPS_SHIELD к началу OUTPUT и FORWARD
 iptables -D OUTPUT -j VPS_SHIELD 2>/dev/null || true
 iptables -I OUTPUT 1 -j VPS_SHIELD
 
 iptables -D FORWARD -j VPS_SHIELD 2>/dev/null || true
 iptables -I FORWARD 1 -j VPS_SHIELD
+
+# --- 6. ИНТЕГРАЦИЯ С XRAY / 3X-UI (УРОВЕНЬ L7 DPI) ---
+sync_xray_bittorrent() {
+    for cfg in "/usr/local/x-ui/bin/config.json" "/etc/xray/config.json" "/usr/local/etc/xray/config.json"; do
+        if [ -f "$cfg" ]; then
+            python3 -c "
+import json, sys
+try:
+    with open('$cfg', 'r') as f:
+        c = json.load(f)
+    r = c.setdefault('routing', {}).setdefault('rules', [])
+    changed = False
+    
+    # L7 Protocol: bittorrent -> blocked
+    if not any('bittorrent' in rule.get('protocol', []) and rule.get('outboundTag') == 'blocked' for rule in r):
+        r.insert(0, {'type': 'field', 'outboundTag': 'blocked', 'protocol': ['bittorrent']})
+        changed = True
+        
+    # L7 Domains: trackers and torrents -> blocked
+    bt_domains = ['keyword:torrent', 'keyword:tracker', 'keyword:announce', 'domain:opentrackr.org', 'domain:openbittorrent.com']
+    if not any(any(d in rule.get('domain', []) for d in bt_domains) and rule.get('outboundTag') == 'blocked' for rule in r):
+        r.insert(0, {'type': 'field', 'outboundTag': 'blocked', 'domain': bt_domains})
+        changed = True
+        
+    if changed:
+        with open('$cfg', 'w') as f:
+            json.dump(c, f, indent=2)
+        print('[VPS-SHIELD] Конфигурация Xray ($cfg) обновлена: активирована L7-блокировка BitTorrent.')
+except Exception as e:
+    print(f'[VPS-SHIELD] Ошибка обновления Xray конфига: {e}', file=sys.stderr)
+" 2>/dev/null || true
+            if systemctl is-active --quiet x-ui; then
+                systemctl restart x-ui >/dev/null 2>&1 || true
+            elif systemctl is-active --quiet xray; then
+                systemctl restart xray >/dev/null 2>&1 || true
+            fi
+        fi
+    done
+}
+sync_xray_bittorrent
 
 echo "[VPS-SHIELD] Все правила защиты успешно активированы!"
 EOF
@@ -316,10 +392,15 @@ status_shield() {
         local rules_cnt
         rules_cnt=$(iptables -n -L VPS_SHIELD --line-numbers | grep -E -c '^[0-9]')
         echo -e " Фаервол (VPS_SHIELD):     ${GREEN}[АКТИВЕН]${NC}      (Всего правил: $rules_cnt)"
-        echo -e " Фильтр BitTorrent (P2P): ${GREEN}[АКТИВЕН]${NC}      (xt_string сигнатуры + порты)"
+        echo -e " Фильтр BitTorrent L4:    ${GREEN}[АКТИВЕН]${NC}      (BEP15/03/DHT + xt_string + P2P-порты)"
     else
         echo -e " Фаервол (VPS_SHIELD):     ${RED}[НЕ АКТИВЕН]${NC}"
-        echo -e " Фильтр BitTorrent (P2P): ${RED}[НЕ АКТИВЕН]${NC}"
+        echo -e " Фильтр BitTorrent L4:    ${RED}[НЕ АКТИВЕН]${NC}"
+    fi
+
+    # L7 Xray status
+    if [ -f "/usr/local/x-ui/bin/config.json" ] || [ -f "/etc/xray/config.json" ]; then
+        echo -e " Фильтр BitTorrent L7 DPI:${GREEN}[АКТИВЕН]${NC}      (Интеграция с Xray/3x-UI)"
     fi
 
     if systemctl is-enabled vps-shield.service >/dev/null 2>&1; then
