@@ -5,11 +5,19 @@
 # ==============================================================================
 set -e
 
+# Защита от параллельного запуска нескольких копий процесса (flock)
+LOCKFILE="/var/lock/vps-shield.lock"
+exec 200>"$LOCKFILE"
+if ! flock -n 200; then
+    echo "[VPS-SHIELD] Процесс уже выполняется в другом потоке. Пропускаем параллельный запуск."
+    exit 0
+fi
+
 echo "[VPS-SHIELD] 1. Настройка ядра (sysctl: отключение ICMP и включение форвардинга)..."
 sysctl -w net.ipv4.icmp_echo_ignore_all=1 >/dev/null
 sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
-echo "[VPS-SHIELD] 2. Создание структур ipset..."
+echo "[VPS-SHIELD] 2. Создание базовых структур ipset..."
 ipset create -exist ip_checkers hash:ip hashsize 4096 maxelem 65536
 ipset create -exist ru_zone hash:net family inet hashsize 16384 maxelem 262144
 
@@ -28,19 +36,24 @@ for dom in "${CHECKER_DOMAINS[@]}"; do
 done
 
 echo "[VPS-SHIELD] 4. Загрузка актуальных CIDR RU-зоны..."
-TMP_RU="/tmp/ru_prefixes.txt"
+TMP_RU=$(mktemp /tmp/ru_prefixes.XXXXXX)
+trap 'rm -f "$TMP_RU"' EXIT
+
 URL_PRIMARY="https://raw.githubusercontent.com/ipverse/rir-ip/master/country/ru/ipv4-aggregated.txt"
 URL_BACKUP="https://www.ipdeny.com/ipblocks/data/aggregated/ru-aggregated.zone"
 
 LOADED=0
+TEMP_SET="ru_tmp_$$"
+
 for url in "$URL_PRIMARY" "$URL_BACKUP"; do
     if curl -sSL --connect-timeout 10 --retry 2 "$url" -o "$TMP_RU" && [ -s "$TMP_RU" ]; then
-        ipset create -exist ru_zone_temp hash:net family inet hashsize 16384 maxelem 262144
-        ipset flush ru_zone_temp
-        grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' "$TMP_RU" | sed 's/^/add ru_zone_temp /' | ipset restore -!
-        ipset swap ru_zone_temp ru_zone
-        ipset destroy ru_zone_temp 2>/dev/null || true
-        rm -f "$TMP_RU"
+        {
+            echo "create $TEMP_SET hash:net family inet hashsize 16384 maxelem 262144 -exist"
+            grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' "$TMP_RU" | sed "s/^/add $TEMP_SET /"
+        } | ipset restore -!
+
+        ipset swap "$TEMP_SET" ru_zone
+        ipset destroy "$TEMP_SET" 2>/dev/null || true
         echo "[VPS-SHIELD] Успешно загружена база RU-зоны из: $url"
         LOADED=1
         break

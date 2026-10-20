@@ -58,15 +58,10 @@ install_shield() {
     check_root
     check_os
 
-    echo -e "\n${CYAN}>>> [1/6] Подготовка репозиториев и установка системных пакетов...${NC}"
-    # Отключаем CD-ROM репозитории, если остались после установки
+    echo -e "\n${CYAN}>>> [1/7] Подготовка репозиториев и установка системных пакетов...${NC}"
     sed -i '/cdrom:/d' /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null || true
-    
-    # Переключаем ru.archive.ubuntu.com на archive.ubuntu.com,
-    # чтобы apt не блокировался правилами блокировки ру-зоны
     sed -i 's/ru\.archive\.ubuntu\.com/archive.ubuntu.com/g' /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null || true
 
-    # Подавляем интерактивные диалоги debconf для автоматической установки
     export DEBIAN_FRONTEND=noninteractive
     echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections 2>/dev/null || true
     echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections 2>/dev/null || true
@@ -75,17 +70,24 @@ install_shield() {
     apt-get install -y ipset iptables iptables-persistent netfilter-persistent curl dnsutils
     modprobe xt_string 2>/dev/null || true
 
-    echo -e "\n${CYAN}>>> [2/6] Создание исполняемого скрипта ядра защиты ($SCRIPT_PATH)...${NC}"
+    echo -e "\n${CYAN}>>> [2/7] Создание исполняемого скрипта ядра защиты ($SCRIPT_PATH)...${NC}"
     cat << 'EOF' > "$SCRIPT_PATH"
 #!/usr/bin/env bash
-# Исполняемый модуль применения правил безопасности VPS Shield
 set -e
+
+# Защита от параллельного запуска нескольких копий процесса (flock)
+LOCKFILE="/var/lock/vps-shield.lock"
+exec 200>"$LOCKFILE"
+if ! flock -n 200; then
+    echo "[VPS-SHIELD] Процесс уже выполняется в другом потоке. Пропускаем параллельный запуск."
+    exit 0
+fi
 
 echo "[VPS-SHIELD] 1. Настройка ядра (sysctl: отключение ICMP и включение форвардинга)..."
 sysctl -w net.ipv4.icmp_echo_ignore_all=1 >/dev/null
 sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
-echo "[VPS-SHIELD] 2. Создание структур ipset..."
+echo "[VPS-SHIELD] 2. Создание базовых структур ipset..."
 ipset create -exist ip_checkers hash:ip hashsize 4096 maxelem 65536
 ipset create -exist ru_zone hash:net family inet hashsize 16384 maxelem 262144
 
@@ -104,19 +106,24 @@ for dom in "${CHECKER_DOMAINS[@]}"; do
 done
 
 echo "[VPS-SHIELD] 4. Загрузка актуальных CIDR RU-зоны..."
-TMP_RU="/tmp/ru_prefixes.txt"
+TMP_RU=$(mktemp /tmp/ru_prefixes.XXXXXX)
+trap 'rm -f "$TMP_RU"' EXIT
+
 URL_PRIMARY="https://raw.githubusercontent.com/ipverse/rir-ip/master/country/ru/ipv4-aggregated.txt"
 URL_BACKUP="https://www.ipdeny.com/ipblocks/data/aggregated/ru-aggregated.zone"
 
 LOADED=0
+TEMP_SET="ru_tmp_$$"
+
 for url in "$URL_PRIMARY" "$URL_BACKUP"; do
     if curl -sSL --connect-timeout 10 --retry 2 "$url" -o "$TMP_RU" && [ -s "$TMP_RU" ]; then
-        ipset create -exist ru_zone_temp hash:net family inet hashsize 16384 maxelem 262144
-        ipset flush ru_zone_temp
-        grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' "$TMP_RU" | sed 's/^/add ru_zone_temp /' | ipset restore -!
-        ipset swap ru_zone_temp ru_zone
-        ipset destroy ru_zone_temp 2>/dev/null || true
-        rm -f "$TMP_RU"
+        {
+            echo "create $TEMP_SET hash:net family inet hashsize 16384 maxelem 262144 -exist"
+            grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?' "$TMP_RU" | sed "s/^/add $TEMP_SET /"
+        } | ipset restore -!
+
+        ipset swap "$TEMP_SET" ru_zone
+        ipset destroy "$TEMP_SET" 2>/dev/null || true
         echo "[VPS-SHIELD] Успешно загружена база RU-зоны из: $url"
         LOADED=1
         break
@@ -171,14 +178,14 @@ echo "[VPS-SHIELD] Все правила защиты успешно актив�
 EOF
     chmod +x "$SCRIPT_PATH"
 
-    echo -e "\n${CYAN}>>> [3/6] Настройка sysctl для персистентного отключения ICMP...${NC}"
+    echo -e "\n${CYAN}>>> [3/7] Настройка sysctl для персистентного отключения ICMP...${NC}"
     cat << 'EOF' > "$SYSCTL_CONF"
 net.ipv4.icmp_echo_ignore_all = 1
 net.ipv4.ip_forward = 1
 EOF
     sysctl -p "$SYSCTL_CONF" >/dev/null
 
-    echo -e "\n${CYAN}>>> [4/6] Настройка автозапуска в systemd...${NC}"
+    echo -e "\n${CYAN}>>> [4/7] Регистрация служб в systemd...${NC}"
     cat << EOF > "$SERVICE_PATH"
 [Unit]
 Description=VPS Shield Security & Anti-Leak Rules
@@ -207,10 +214,10 @@ EOF
     cat << EOF > "$TIMER_PATH"
 [Unit]
 Description=Daily Update of VPS Shield IPsets
-Requires=vps-shield-update.service
 
 [Timer]
 OnCalendar=daily
+RandomizedDelaySec=300
 Persistent=true
 
 [Install]
@@ -219,13 +226,15 @@ EOF
 
     systemctl daemon-reload
     systemctl enable vps-shield.service >/dev/null 2>&1
-    systemctl enable --now vps-shield-update.timer >/dev/null 2>&1
 
-    echo -e "\n${CYAN}>>> [5/6] Первичный запуск и инициализация правил защиты...${NC}"
+    echo -e "\n${CYAN}>>> [5/7] Первичный запуск и инициализация правил защиты...${NC}"
     bash "$SCRIPT_PATH"
 
-    echo -e "\n${CYAN}>>> [6/6] Сохранение правил в netfilter-persistent...${NC}"
+    echo -e "\n${CYAN}>>> [6/7] Сохранение правил в netfilter-persistent...${NC}"
     netfilter-persistent save 2>/dev/null || iptables-save > /etc/iptables/rules.v4
+
+    echo -e "\n${CYAN}>>> [7/7] Запуск таймера ежедневного автообновления...${NC}"
+    systemctl enable --now vps-shield-update.timer >/dev/null 2>&1
 
     echo -e "\n${GREEN}====================================================${NC}"
     echo -e "${GREEN}[УСПЕХ] VPS Shield успешно установлен и активен!${NC}"
@@ -256,7 +265,7 @@ uninstall_shield() {
     iptables -X VPS_SHIELD 2>/dev/null || true
 
     echo -e "${CYAN}[3/6] Очистка и удаление таблиц ipset...${NC}"
-    for s in ru_zone ru_zone_temp ip_checkers; do
+    for s in $(ipset list -n 2>/dev/null | grep -E '^(ru_zone|ru_tmp|ip_checkers)'); do
         ipset flush "$s" 2>/dev/null || true
         ipset destroy "$s" 2>/dev/null || true
     done
@@ -266,7 +275,7 @@ uninstall_shield() {
     sysctl -w net.ipv4.icmp_echo_ignore_all=0 >/dev/null
 
     echo -e "${CYAN}[5/6] Удаление исполняемого файла ($SCRIPT_PATH)...${NC}"
-    rm -f "$SCRIPT_PATH"
+    rm -f "$SCRIPT_PATH" /var/lock/vps-shield.lock
 
     echo -e "${CYAN}[6/6] Сохранение чистого состояния фаервола...${NC}"
     netfilter-persistent save 2>/dev/null || iptables-save > /etc/iptables/rules.v4
