@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# VPS Shield v1.4.0 - Быстрый установщик (One-liner installer)
+# VPS Shield v1.4.1 - Быстрый установщик (One-liner installer)
 #
 # Использование:
 #   curl -sSL https://raw.githubusercontent.com/sb218-dev/vps-shield/main/install.sh | sudo bash

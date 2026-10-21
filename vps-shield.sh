@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# VPS Shield v1.4.0 - Исполняемый модуль применения правил сетевой безопасности
+# VPS Shield v1.4.1 - Исполняемый модуль применения правил сетевой безопасности
 # Репозиторий: https://github.com/sb218-dev/vps-shield
 #
 # Изменения v1.4.0 (по итогам живого аудита на песочнице, см. MEMORY.md):
@@ -20,6 +20,16 @@
 #  - LOG-цепочка с -m limit для диагностики дропов
 #  - ip_forward включается только при обнаружении Docker
 #  - Бэкапы конфигов панелей перед L7-правкой
+#
+# Изменения v1.4.1 (закрытие главной дыры — живой тест qBittorrent, см. MEMORY.md):
+#  - uTP (UDP-транспорт BitTorrent на СЛУЧАЙНЫХ портах, основной транспорт
+#    qBittorrent) блокируется по сигнатуре заголовка через -m u32: первый байт
+#    UDP-payload = type<<4|version(1) -> 0x01 DATA / 0x11 FIN / 0x21 STATE /
+#    0x31 RESET / 0x41 SYN. Ранее uTP проходил мимо щита целиком (живой тест:
+#    2411 пакетов ACCEPT, 0 дропов — не bencode, порты случайные).
+#  - Исключения ПЕРЕД дропом: WireGuard handshake (payload ровно 01 00 00 00),
+#    STUN (magic cookie 0x2112A442 на смещении 12); QUIC/Hysteria2/TUIC уже
+#    разрешены выше по портам туннелей. Сигнатуры проверены живым u32-тестом на VM.
 # ==============================================================================
 set -e
 
@@ -270,6 +280,34 @@ done
 for p in $(echo $TUNNEL_UDP_PORTS | tr ' ' '\n' | sort -un); do
     iptables -A VPS_SHIELD -p udp --dport "$p" -j ACCEPT 2>/dev/null || true
 done
+
+# Ж-2. БЛОКИРОВКА uTP (UDP-транспорт BitTorrent) ПО СИГНАТУРЕ ЗАГОЛОВКА (-m u32).
+# СУТЬ ПРАВИЛА: -m u32 позволяет iptables читать произвольные байты пакета по
+# смещению. Выражение "0>>22&0x3C@8" означает: из байта 0 IP-заголовка сдвигом
+# на 22 и маской 0x3C выделить IHL (реальную длину IP-заголовка), пропустить её
+# и ещё 8 байтов UDP-заголовка (@8) — курсор встаёт на ПЕРВЫЙ байт UDP-payload.
+# Заголовок uTP начинается байтом type<<4|version(1):
+#   0x01 ST_DATA, 0x11 ST_FIN, 0x21 ST_STATE, 0x31 ST_RESET, 0x41 ST_SYN
+# по этим пяти значениям первого байта и дропаем (маска 0xFF000000 = сравнивается
+# только первый байт, младшие три байта не проверяются).
+# ПОЧЕМУ ЭТО НУЖНО: порты у uTP случайные (1024-65535) — портовые правила его
+# не видят; bencode-сигнатуры DHT не матчатся (uTP — бинарный протокол, не bencode).
+# ПОРЯДОК ВАЖЕН (защита от ложняков, все сценарии проверены живым u32-тестом на VM):
+#  1) порты туннелей уже разрешены выше (QUIC/Hysteria2/TUIC/WireGuard);
+#  2) WireGuard handshake initiation: payload = ровно 01 00 00 00
+#     (uTP DATA с connection_id 0x0000 на практике не встречается) -> ACCEPT;
+#  3) STUN (WebRTC/NAT-traversal): magic cookie 0x2112A442 в байтах 4-7 payload
+#     (смещение 12 от начала IP-пакета) -> ACCEPT;
+#  4) дроп пяти типов uTP с логом (VPS_SHIELD_LOG).
+# Остаточный риск: QUIC short-header (первый байт 0x40-0x7F) на НЕстандартном
+# порту может совпасть с uTP SYN (0x41) — на стене подтверждён только для портов
+# вне списка туннелей (443 и слушающие порты исключены выше по цепочке).
+iptables -A VPS_SHIELD -p udp --dport 1024:65535 -m u32 --u32 "0>>22&0x3C@8=0x01000000" -j ACCEPT 2>/dev/null || true
+iptables -A VPS_SHIELD -p udp --dport 1024:65535 -m u32 --u32 "0>>22&0x3C@12=0x2112A442" -j ACCEPT 2>/dev/null || true
+for utp_hdr in 0x01000000 0x11000000 0x21000000 0x31000000 0x41000000; do
+    iptables -A VPS_SHIELD -p udp --dport 1024:65535 -m u32 --u32 "0>>22&0x3C@8&0xFF000000=$utp_hdr" -j VPS_SHIELD_LOG 2>/dev/null || true
+done
+
 iptables -A VPS_SHIELD -p udp --dport 1024:65535 -m state --state NEW -m limit --limit 50/sec --limit-burst 100 -j ACCEPT
 iptables -A VPS_SHIELD -p udp --dport 1024:65535 -m state --state NEW -j VPS_SHIELD_LOG
 
